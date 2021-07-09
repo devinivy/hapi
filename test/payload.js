@@ -77,6 +77,92 @@ describe('Payload', () => {
         expect(request.response.output.statusCode).to.equal(500);
     });
 
+    it('handles closed connection during lifecycle, pre-response', async () => {
+        /**
+         * This is a bit of a "bad" case, since the response is closed but request not aborted.
+         *
+         * _reply() doesn't like being called without a response, which is what happens here:
+         *
+         *     5) Payload handles closed connection during lifecycle, pre-response:
+         *
+         *     Cannot read property 'statusCode' of null
+         *
+         *     at Request._finalize (/x/hapi/lib/request.js:501:31)
+         *     at Request._reply (/x/hapi/lib/request.js:438:18)
+         *     at Request._execute (/x/hapi/lib/request.js:282:14)
+         */
+
+        const server = Hapi.server();
+        const log = server.events.once('response');
+
+        server.ext('onPreHandler', async (request, h) => {
+
+            request.raw.res.destroy();
+
+            await new Promise(process.nextTick);
+
+            return h.continue;
+        });
+
+        server.route({
+            method: 'GET',
+            path: '/',
+            handler: () => 'this response is not seen'
+        });
+
+        const res = await server.inject('/');
+        expect(res.statusCode).to.equal(499);
+        expect(res.statusMessage).to.equal('Unknown');
+
+        // Not obvious what these values should be, as there is no response from the server
+        expect(res.raw.res.statusCode).to.equal(204);
+        expect(res.raw.res.statusMessage).to.equal('No Content');
+        expect(res.rawPayload.toString()).to.equal('');
+
+        const [request] = await log;
+        expect(request.response.statusCode).to.equal(499);
+        expect(request.info.completed).to.be.above(0);
+        expect(request.info.responded).to.equal(0);
+    });
+
+    it('handles aborted request mid-lifecycle step', async (flags) => {
+
+        let req = null;
+        const server = Hapi.server();
+
+        server.route({
+            method: 'GET',
+            path: '/',
+            handler: async (request) => {
+
+                req.destroy();
+
+                await request.events.once('disconnect');
+
+                return 'ok';
+            }
+        });
+
+        flags.onCleanup = () => server.stop();
+        await server.start();
+
+        req = Http.request({
+            hostname: 'localhost',
+            port: server.info.port,
+            method: 'get'
+        });
+
+        req.on('error', Hoek.ignore);
+        req.end();
+
+        const [request] = await server.events.once('response');
+
+        expect(request.response.isBoom).to.be.true();
+        expect(request.response.output.statusCode).to.equal(499);
+        expect(request.info.completed).to.be.above(0);
+        expect(request.info.responded).to.equal(0);
+    });
+
     it('handles aborted request', { retry: true }, async () => {
 
         const server = Hapi.server();
